@@ -1,3 +1,8 @@
+# combo_qsirecon.py - interactive launcher for QSIRecon 1.0.0 (Docker) on the COMBO cohorts (Moms or Babies).
+# Scans raw BIDS + QSIPrep outputs, audits each subject (READY / Completed / Missing Inputs), then runs the READY ones.
+# Detects the EC2's CPUs/RAM, proposes N concurrent containers (default 1 per 8 cores, RAM reserved for the OS), editable.
+# Each subject runs in its own container/work dir (deleted on success), logging to sub-<ID>_qsirecon.log in the cwd.
+# Usage: python3 combo_qsirecon.py -> pick cohort -> 1=Audit, 2=Run All, 3=Test (first 3), 0=Exit.
 import os
 import sys
 import shutil
