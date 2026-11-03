@@ -22,7 +22,7 @@ def get_system_specs():
 SYSTEM_CORES, SYSTEM_RAM_GB, EC2_HOURLY_RATE = get_system_specs()
 
 CORES_PER_CONTAINER = 8        # default sizing: 32 CPUs -> 4 concurrent subjects
-MIN_GB_PER_CONTAINER = 24      # don't default to more containers than RAM supports
+MIN_GB_PER_CONTAINER = 8       # minimum RAM per container (default sizing and manual entry)
 RESERVED_RAM_GB = max(8.0, SYSTEM_RAM_GB * 0.10)  # headroom for OS/docker/baseline processes
 
 #BASE_BIDS_DIR = Path("/MRI_Projects/marscombo/rawdata")
@@ -207,7 +207,7 @@ def prompt_resource_plan(n_subjects):
     while True:
         workers = _ask_number("Concurrent containers", d_workers, int, 1)
         threads = _ask_number("Threads per container", max(1, SYSTEM_CORES // workers), int, 1)
-        mem_gb = _ask_number("RAM per container (GB)", round(usable_gb / workers, 1), float, 1.0)
+        mem_gb = _ask_number("RAM per container (GB)", round(usable_gb / workers, 1), float, MIN_GB_PER_CONTAINER)
         if workers * mem_gb > usable_gb:
             print(f"  {workers} x {mem_gb} GB = {workers * mem_gb:.0f} GB exceeds the {usable_gb:.0f} GB usable "
                   f"(must leave {RESERVED_RAM_GB:.0f} GB for the system). Try again.")
