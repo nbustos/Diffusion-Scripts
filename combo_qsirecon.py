@@ -21,6 +21,10 @@ def get_system_specs():
 
 SYSTEM_CORES, SYSTEM_RAM_GB, EC2_HOURLY_RATE = get_system_specs()
 
+CORES_PER_CONTAINER = 8        # default sizing: 32 CPUs -> 4 concurrent subjects
+MIN_GB_PER_CONTAINER = 24      # don't default to more containers than RAM supports
+RESERVED_RAM_GB = max(8.0, SYSTEM_RAM_GB * 0.10)  # headroom for OS/docker/baseline processes
+
 #BASE_BIDS_DIR = Path("/MRI_Projects/marscombo/rawdata")
 BASE_BIDS_DIR = Path("/Marshlab/Projects/COMBO_8105/5_Data/marscombo_scan_data/marscombo/rawdata")
 # UPDATED PATH: Pointing to the writable drive for Moms
@@ -171,15 +175,56 @@ def process_subject_wrapper(s, nthreads, mem_mb, cohort_target):
     if success and sub_work_dir.exists(): shutil.rmtree(sub_work_dir)
     return {"subject": s.name, "status": "SUCCESS" if success else "FAILED", "duration_min": dur / 60, "error": err_msg}
 
+def default_resource_plan(n_subjects):
+    """Default: 1 container per 8 cores (32 CPU / 128 GB -> 4 containers of 8 threads),
+    limited so each container gets at least MIN_GB_PER_CONTAINER of the RAM left after the host reserve."""
+    usable_gb = max(0.0, SYSTEM_RAM_GB - RESERVED_RAM_GB)
+    workers = max(1, min(SYSTEM_CORES // CORES_PER_CONTAINER, int(usable_gb // MIN_GB_PER_CONTAINER), n_subjects))
+    nthreads = max(1, SYSTEM_CORES // workers)
+    mem_gb = round(usable_gb / workers, 1)
+    return workers, nthreads, mem_gb
+
+def _ask_number(label, default, cast, minimum):
+    while True:
+        raw = input(f"{label} [{default}]: ").strip()
+        if not raw: return default
+        try:
+            val = cast(raw)
+            if val >= minimum: return val
+        except ValueError: pass
+        print(f"  Enter a number >= {minimum}.")
+
+def prompt_resource_plan(n_subjects):
+    """Show detected resources and defaults; let the user override containers, threads and RAM per container."""
+    d_workers, d_threads, d_mem = default_resource_plan(n_subjects)
+    usable_gb = max(0.0, SYSTEM_RAM_GB - RESERVED_RAM_GB)
+    print(f"\nDetected: {SYSTEM_CORES} CPUs | {SYSTEM_RAM_GB:.0f} GB RAM "
+          f"(reserving {RESERVED_RAM_GB:.0f} GB for the system, {usable_gb:.0f} GB usable)")
+    print(f"Default plan: {d_workers} concurrent containers x {d_threads} threads x {d_mem} GB RAM")
+    if input("Customize? (y/N): ").strip().lower() != 'y':
+        return d_workers, d_threads, d_mem
+
+    while True:
+        workers = _ask_number("Concurrent containers", d_workers, int, 1)
+        threads = _ask_number("Threads per container", max(1, SYSTEM_CORES // workers), int, 1)
+        mem_gb = _ask_number("RAM per container (GB)", round(usable_gb / workers, 1), float, 1.0)
+        if workers * mem_gb > usable_gb:
+            print(f"  {workers} x {mem_gb} GB = {workers * mem_gb:.0f} GB exceeds the {usable_gb:.0f} GB usable "
+                  f"(must leave {RESERVED_RAM_GB:.0f} GB for the system). Try again.")
+            continue
+        if workers * threads > SYSTEM_CORES:
+            print(f"  Warning: {workers * threads} total threads oversubscribes {SYSTEM_CORES} CPUs.")
+        return workers, threads, mem_gb
+
 def pipeline_execution_loop(ready_subs, cohort_target):
     if not ready_subs: return
-    workers = max(1, min(2, SYSTEM_CORES // 4)) 
-    nthreads = max(2, SYSTEM_CORES // workers)
-    mem_mb = int(max(4.0, (SYSTEM_RAM_GB * 0.85) / workers) * 1024)
-    
+    workers, nthreads, mem_gb = prompt_resource_plan(len(ready_subs))
+    if workers is None: return
+    mem_mb = int(mem_gb * 1024)
+
     confirm = input(f"Launch {workers} concurrent containers ({nthreads} threads | {mem_mb} MB RAM each)? (y/n): ")
     if confirm.lower() != 'y': return
-    
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {executor.submit(process_subject_wrapper, s, nthreads, mem_mb, cohort_target): s for s in ready_subs}
         for future in concurrent.futures.as_completed(futures):
