@@ -1,8 +1,9 @@
 # combo_qsirecon.py - interactive launcher for QSIRecon 1.0.0 (Docker) on the COMBO cohorts (Moms or Babies).
 # Scans raw BIDS + QSIPrep outputs, audits each subject (READY / Completed / Missing Inputs), then runs the READY ones.
 # Detects the EC2's CPUs/RAM, proposes N concurrent containers (default 1 per 8 cores, RAM reserved for the OS), editable.
-# Each subject runs in its own container/work dir (deleted on success), logging to sub-<ID>_qsirecon.log in the cwd.
-# Usage: python3 combo_qsirecon.py -> pick cohort -> 1=Audit, 2=Run All, 3=Test (first 3), 0=Exit.
+# Each subject runs in its own container/work dir (deleted on success), logging to sub-<ID>_qsirecon.log in the cwd. After a run, subjects missing a dwi output folder are listed.
+# Usage: python3 combo_qsirecon.py -> pick cohort -> 1=Audit, 2=Run All, 3=Test (first 3), 4=Delete failed subjects (all qsirecon outputs), 0=Exit.
+
 import os
 import sys
 import shutil
@@ -39,6 +40,7 @@ INPUT_QSIPREP_BABIES_DIR = Path("/MRI_Projects/marscombo/derivatives/qsiprep1.0.
 OUTPUT_DERIVATIVES_DIR = Path("/Marshlab/data/COMBO/derivatives/qsirecon1.0.0")
 GLOBAL_WORK_DIR = Path("/Marshlab/data/proc_work_dirs/qsirecon_wd")
 FS_LICENSE = Path("/var/tmp/freesurfer_lic/license.txt")
+CHECK_OUTPUT_DIR = "qsirecon-DSIStudio"  # post-run check looks for <OUTPUT>/derivatives/<this>/<sub>/<ses>/dwi
 
 class Subject:
     def __init__(self, path):
@@ -236,18 +238,72 @@ def pipeline_execution_loop(ready_subs, cohort_target):
             m = future.result()
             print(f"[{m['status']}] {m['subject']} | Time: {m['duration_min']:.2f} min")
 
+    check_dwi_outputs(ready_subs)
+
+def check_dwi_outputs(subs):
+    """After a run, list subjects in this batch with no <CHECK_OUTPUT_DIR>/<sub>/<ses>/dwi directory."""
+    missing = []
+    for s in subs:
+        sub_dir = OUTPUT_DERIVATIVES_DIR / "derivatives" / CHECK_OUTPUT_DIR / s.name
+        sessions = sorted(p for p in sub_dir.glob("ses-*") if p.is_dir()) if sub_dir.is_dir() else []
+        if not sessions:
+            missing.append(f"{s.name} (no session folders in {CHECK_OUTPUT_DIR})")
+        else:
+            missing.extend(f"{s.name}/{ses.name} (no dwi folder)" for ses in sessions if not (ses / "dwi").is_dir())
+    print(f"\n====== OUTPUT CHECK ({CHECK_OUTPUT_DIR}/<sub>/<ses>/dwi) ======")
+    if missing:
+        print(f"MISSING dwi output for {len(missing)} of {len(subs)} subjects run:")
+        for m in missing: print(f"  - {m}")
+    else:
+        print(f"All {len(subs)} subjects have a dwi output folder.")
+
+def delete_failed_subjects():
+    """Delete subjects' folders from the base output dir and every derivatives/qsirecon* subdir (after confirmation)."""
+    raw = input("Subject IDs to delete (space-separated, e.g. 1755138P sub-R1762041): ").split()
+    names = []
+    for r in raw:
+        name = r if r.startswith("sub-") else f"sub-{r}"
+        if len(name) <= 4 or "/" in name or ".." in name:
+            print(f"  Skipping invalid ID: {r}")
+        elif name not in names:
+            names.append(name)
+
+    roots = [OUTPUT_DERIVATIVES_DIR]
+    deriv_dir = OUTPUT_DERIVATIVES_DIR / "derivatives"
+    if deriv_dir.is_dir():
+        roots += sorted(d for d in deriv_dir.iterdir() if d.is_dir() and d.name.startswith("qsirecon"))
+    targets = [root / n for n in names for root in roots if (root / n).is_dir()]
+
+    for n in names:
+        if not any(t.name == n for t in targets): print(f"  Nothing found for {n}")
+    if not targets: return False
+    print("\nThe following folders will be PERMANENTLY deleted:")
+    for t in targets: print(f"  {t}")
+    if input(f"Delete these {len(targets)} folders? (y/n): ").strip().lower() != 'y':
+        print("Cancelled.")
+        return False
+    for t in targets:
+        try:
+            shutil.rmtree(t)
+            print(f"  Deleted {t}")
+        except Exception as e:
+            print(f"  [ERROR] Could not delete {t}: {e}")
+    return True
+
 def main():
     print("=== QSIRECON INITIALIZATION ===")
     cohort_target = "moms" if input("Cohort [1=Moms, 2=Babies]: ").strip() == "1" else "babies"
     subs = get_subjects(cohort_target)
-    
+
     while True:
-        print("\n1. Audit | 2. Run All | 3. Run TEST (First 3) | 0. Exit")
+        print("\n1. Audit | 2. Run All | 3. Run TEST (First 3) | 4. Delete failed subjects | 0. Exit")
         choice = input("Select Task: ")
         if choice == "0": sys.exit(0)
         elif choice == "1": run_audit(subs, cohort_target)
         elif choice == "2": pipeline_execution_loop(run_audit(subs, cohort_target), cohort_target)
         elif choice == "3": pipeline_execution_loop(run_audit(subs, cohort_target)[:3], cohort_target)
+        elif choice == "4": delete_failed_subjects()
+        if choice in ("2", "3", "4"): subs = get_subjects(cohort_target)  # refresh output status
 
 if __name__ == "__main__":
     main()
