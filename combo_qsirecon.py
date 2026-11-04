@@ -143,6 +143,11 @@ def run_audit(subs, cohort_target):
         else: ready.append(s)
     print(f"\n====== QSIRECON AUDIT ({cohort_target.upper()}) ======")
     print(f"READY: {len(ready)} | Completed: {len(completed)} | Missing Inputs: {len(missing)}\n")
+    if ready:
+        print("READY subjects:")
+        ready.sort(key=lambda x: x.name)  # sorted so "First 3" in TEST matches the printed order
+        for s in ready: print(f"  {s.name}")
+        print()
     return ready
 
 def process_subject_wrapper(s, nthreads, mem_mb, cohort_target):
@@ -258,7 +263,7 @@ def check_dwi_outputs(subs):
         print(f"All {len(subs)} subjects have a dwi output folder.")
 
 def delete_failed_subjects():
-    """Delete subjects' folders from the base output dir and every derivatives/qsirecon* subdir (after confirmation)."""
+    """Delete subjects' folders from the base output dir, every derivatives/qsirecon* subdir and the work dir (after confirmation)."""
     raw = input("Subject IDs to delete (space-separated, e.g. 1755138P sub-R1762041): ").split()
     names = []
     for r in raw:
@@ -272,6 +277,7 @@ def delete_failed_subjects():
     deriv_dir = OUTPUT_DERIVATIVES_DIR / "derivatives"
     if deriv_dir.is_dir():
         roots += sorted(d for d in deriv_dir.iterdir() if d.is_dir() and d.name.startswith("qsirecon"))
+    roots.append(GLOBAL_WORK_DIR)  # also clears stale work dirs / BIDS indexes left by failed runs
     targets = [root / n for n in names for root in roots if (root / n).is_dir()]
 
     for n in names:
