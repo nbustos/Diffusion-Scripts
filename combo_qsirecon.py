@@ -30,6 +30,8 @@ SYSTEM_CORES, SYSTEM_RAM_GB, EC2_HOURLY_RATE = get_system_specs()
 CORES_PER_CONTAINER = 8        # default sizing: 32 CPUs -> 4 concurrent subjects
 MIN_GB_PER_CONTAINER = 8       # minimum RAM per container (default sizing and manual entry)
 RESERVED_RAM_GB = max(8.0, SYSTEM_RAM_GB * 0.10)  # headroom for OS/docker/baseline processes
+# Fixed defaults for known instance types: (cpus, rounded GB RAM) -> (containers, threads each, GB RAM each)
+INSTANCE_PRESETS = {(16, 62): (2, 8, 22.0)}
 
 #BASE_BIDS_DIR = Path("/MRI_Projects/marscombo/rawdata")
 BASE_BIDS_DIR = Path("/Marshlab/Projects/COMBO_8105/5_Data/marscombo_scan_data/marscombo/rawdata")
@@ -191,6 +193,10 @@ def default_resource_plan(n_subjects):
     """Default: 1 container per 8 cores (32 CPU / 128 GB -> 4 containers of 8 threads),
     limited so each container gets at least MIN_GB_PER_CONTAINER of the RAM left after the host reserve."""
     usable_gb = max(0.0, SYSTEM_RAM_GB - RESERVED_RAM_GB)
+    preset = INSTANCE_PRESETS.get((SYSTEM_CORES, round(SYSTEM_RAM_GB)))
+    if preset:
+        workers, nthreads, mem_gb = preset
+        return max(1, min(workers, n_subjects)), nthreads, mem_gb
     workers = max(1, min(SYSTEM_CORES // CORES_PER_CONTAINER, int(usable_gb // MIN_GB_PER_CONTAINER), n_subjects))
     nthreads = max(1, SYSTEM_CORES // workers)
     mem_gb = round(usable_gb / workers, 1)
