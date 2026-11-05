@@ -1,8 +1,10 @@
 # qc_qsirecon_bundles.py - QC of QSIRecon DSI Studio bundles (MRtrix .tck.gz) for the COMBO cohorts. Run with --mode mom or --mode baby.
-# Moms: bundles are space-T1w, overlaid on the native QSIPrep T1w. Babies: bundles are space-ACPC, overlaid on the ACPC QSIPrep T1w (T2w fallback).
+# Moms: bundles are space-T1w, overlaid on the raw BIDS T1w (QSIPrep only wrote ACPC anatomy; no T1w-space mask, so only an outside-image check). Babies: bundles are space-ACPC, overlaid on the ACPC QSIPrep T1w (T2w fallback).
 # Per subject/session: streamline counts (read from .tck headers), fraction of streamline points outside the brain mask, and a PNG of bundle density on the anatomy.
 # Flags empty bundles, bundles missing relative to the rest of the cohort, and bundles outside the brain mask. Writes CSVs + PNGs to a separate QC folder (inputs are read-only).
 # Usage: python3 qc_qsirecon_bundles.py --mode mom [--subjects 1755138P R1762041 ...] [--out DIR] [--limit N]; needs numpy, nibabel, matplotlib (no MRtrix needed).
+
+
 import argparse
 import csv
 import gzip
@@ -18,16 +20,18 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from combo_qsirecon import INPUT_QSIPREP_MOMS_DIR, INPUT_QSIPREP_BABIES_DIR, OUTPUT_DERIVATIVES_DIR, CHECK_OUTPUT_DIR
+from combo_qsirecon import BASE_BIDS_DIR, INPUT_QSIPREP_MOMS_DIR, INPUT_QSIPREP_BABIES_DIR, OUTPUT_DERIVATIVES_DIR, CHECK_OUTPUT_DIR
 
 MODES = {
     # space: the "space-" entity in the bundle filenames; anat_kinds: QSIPrep anatomical images to try, in order
-    "mom":  dict(space="T1w",  qsiprep=INPUT_QSIPREP_MOMS_DIR,   anat_kinds=["desc-preproc_T1w"],
+    "mom":  dict(space="T1w",  qsiprep=INPUT_QSIPREP_MOMS_DIR,   anat_kinds=None,  # None -> raw BIDS T1w (QSIPrep anat is ACPC only)
                  is_cohort=lambda i: i.lower().endswith("p")),
     "baby": dict(space="ACPC", qsiprep=INPUT_QSIPREP_BABIES_DIR, anat_kinds=["desc-preproc_T1w", "desc-preproc_T2w"],
                  is_cohort=lambda i: i[-1].isdigit()),
 }
-DEFAULT_OUT = Path("/Marshlab/data/COMBO/qc")
+RAW_BIDS_DIR = BASE_BIDS_DIR
+QSIRECON_DIR = OUTPUT_DERIVATIVES_DIR  # overridable with --qsirecon-dir
+DEFAULT_OUT = Path("/Marshlab/data/COMBO/diffusion_qc")
 KEY_BUNDLES = ["CorpusCallosum", "ArcuateFasciculus", "CorticospinalTract", "OpticRadiation", "InferiorFrontoOccipital", "Cingulum", "UncinateFasciculus"]
 EXTRA_BUNDLE_DIRS = ["UF_L", "UF_R"]  # extra derivatives/ folders holding flat <sub>_<ses>_..._bundle-*.tck.gz files (uncinate)
 MAX_OUTSIDE_MASK = 0.10  # flag a bundle if more than this fraction of its points fall outside the brain mask (a starting guess)
@@ -55,6 +59,13 @@ def find_anat(qsiprep_dir, sub, ses, space, kind):
     else: ok = lambda p: "space-" not in p.name or f"space-{space}" in p.name  # native T1w carries no space entity
     cands = [p for p in (qsiprep_dir / sub).rglob(f"*{kind}.nii.gz") if p.parent.name == "anat" and ok(p)]
     mine = [p for p in cands if ses in p.parts or f"_{ses}_" in p.name]
+    pick = mine or cands
+    return sorted(pick)[0] if pick else None
+
+def find_raw_t1w(raw_dir, sub, ses):
+    """Raw BIDS T1w (native space = QSIPrep's space-T1w): <raw>/sub/ses/anat/*_T1w.nii.gz, else <raw>/sub/anat/."""
+    cands = [p for p in (raw_dir / sub).rglob("*_T1w.nii.gz") if p.parent.name == "anat"]
+    mine = [p for p in cands if ses in p.parts]
     pick = mine or cands
     return sorted(pick)[0] if pick else None
 
@@ -95,7 +106,7 @@ def qc_session(mode, sub, ses, dwi_dir, fig_dir, key_bundles):
     pattern = f"_space-{cfg['space']}_model-gqi_bundle-*_streamlines.tck.gz"
     files = {f.name: f for f in dwi_dir.glob("*" + pattern)}
     for extra in EXTRA_BUNDLE_DIRS:
-        for f in (OUTPUT_DERIVATIVES_DIR / "derivatives" / extra).rglob(f"{sub}_{ses}_*" + pattern):
+        for f in (QSIRECON_DIR / "derivatives" / extra).rglob(f"{sub}_{ses}_*" + pattern):
             files.setdefault(f.name, f)  # a file also present under qsirecon-DSIStudio is used from there
     files = [files[k] for k in sorted(files)]
     summary = dict(subject=sub, session=ses, space=cfg["space"], n_bundles=len(files), anat="", mask="", flags="")
@@ -104,11 +115,14 @@ def qc_session(mode, sub, ses, dwi_dir, fig_dir, key_bundles):
         summary["flags"] = f"NO_BUNDLES_IN_SPACE_{cfg['space']}"
         return summary, bundle_rows, set()
 
-    anat_path = next((p for k in cfg["anat_kinds"] if (p := find_anat(cfg["qsiprep"], sub, ses, cfg["space"], k))), None)
-    mask_path = find_anat(cfg["qsiprep"], sub, ses, cfg["space"], "desc-brain_mask")
+    if cfg["anat_kinds"] is None:  # moms: raw T1w, and no T1w-space brain mask exists
+        anat_path, mask_path = find_raw_t1w(RAW_BIDS_DIR, sub, ses), None
+    else:
+        anat_path = next((p for k in cfg["anat_kinds"] if (p := find_anat(cfg["qsiprep"], sub, ses, cfg["space"], k))), None)
+        mask_path = find_anat(cfg["qsiprep"], sub, ses, cfg["space"], "desc-brain_mask")
     summary["anat"], summary["mask"] = str(anat_path or ""), str(mask_path or "")
     if anat_path is None: flags.append("NO_ANAT")
-    if mask_path is None: flags.append("NO_MASK")
+    if mask_path is None and cfg["anat_kinds"] is not None: flags.append("NO_MASK")
 
     anat_img = nib.load(anat_path) if anat_path else None
     mask = np.asarray(nib.load(mask_path).dataobj) if mask_path else None
@@ -156,12 +170,19 @@ def main():
     ap.add_argument("--mode", required=True, choices=MODES, help="mom = space-T1w bundles, baby = space-ACPC bundles")
     ap.add_argument("--subjects", nargs="*", help="subject IDs (with or without 'sub-'); default: every subject of this cohort found in the outputs")
     ap.add_argument("--out", type=Path, default=DEFAULT_OUT, help=f"QC output root (default {DEFAULT_OUT})")
+    ap.add_argument("--qsirecon-dir", type=Path, help=f"QSIRecon output root containing derivatives/ (default {OUTPUT_DERIVATIVES_DIR})")
+    ap.add_argument("--qsiprep-dir", type=Path, help="QSIPrep output root for this mode (babies: ACPC T2w/T1w + brain mask)")
+    ap.add_argument("--rawdata-dir", type=Path, help=f"raw BIDS root, used for the moms' T1w (default {BASE_BIDS_DIR})")
     ap.add_argument("--limit", type=int, help="only QC the first N sessions (for testing)")
     ap.add_argument("--key-bundles", nargs="*", default=KEY_BUNDLES, help="bundle-name substrings to show as their own figure rows")
     args = ap.parse_args()
 
+    global QSIRECON_DIR, RAW_BIDS_DIR
     cfg = MODES[args.mode]
-    dsi_dir = OUTPUT_DERIVATIVES_DIR / "derivatives" / CHECK_OUTPUT_DIR
+    if args.qsirecon_dir: QSIRECON_DIR = args.qsirecon_dir
+    if args.qsiprep_dir: cfg["qsiprep"] = args.qsiprep_dir
+    if args.rawdata_dir: RAW_BIDS_DIR = args.rawdata_dir
+    dsi_dir = QSIRECON_DIR / "derivatives" / CHECK_OUTPUT_DIR
     if not dsi_dir.is_dir(): sys.exit(f"[ERROR] {dsi_dir} not found")
     if args.subjects: subs = [s if s.startswith("sub-") else f"sub-{s}" for s in args.subjects]
     else: subs = sorted(d.name for d in dsi_dir.glob("sub-*") if d.is_dir() and cfg["is_cohort"](d.name[4:]))
