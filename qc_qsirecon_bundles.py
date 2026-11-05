@@ -2,13 +2,14 @@
 # Moms: space-ACPC bundles on the ACPC QSIPrep T1w. Babies: space-ACPC bundles on the ACPC QSIPrep T2w (T1w if present). Both use the ACPC brain mask.
 # Per subject/session: streamline counts (read from .tck headers), fraction of streamline points outside the brain mask, and a PNG of bundle density on the anatomy.
 # Flags empty bundles, bundles missing relative to the rest of the cohort, and bundles outside the brain mask. Writes CSVs + PNGs to a separate QC folder (inputs are read-only).
-# Usage: python3 qc_qsirecon_bundles.py --mode mom [--subjects 1755138P R1762041 ...] [--out DIR] [--limit N]; needs numpy, nibabel, matplotlib (no MRtrix needed).
+# Visual check: --view SUBJECT opens that subject's anatomy + mask + bundles in MRtrix mrview. Usage: python3 qc_qsirecon_bundles.py --mode mom [--subjects 1755138P R1762041 ...] [--out DIR] [--limit N]; needs numpy, nibabel, matplotlib (no MRtrix needed).
 
 
 import argparse
 import csv
 import gzip
 import re
+import subprocess
 import warnings
 import shutil
 import sys
@@ -35,6 +36,13 @@ MODES = {
 QSIRECON_DIR = OUTPUT_DERIVATIVES_DIR  # overridable with --qsirecon-dir
 FLAT_BUNDLES_DIR = None  # --bundles-dir: one flat folder of <sub>_<ses>_*.tck.gz files instead of the QSIRecon tree
 DEFAULT_OUT = Path("/Marshlab/data/COMBO/diffusion_qc")
+# Local copy of the data (R_SYNC.sh layout): flat bundles + ANAT (QSIPrep anatomy) folders. If it exists it becomes the default,
+# so e.g. `--view 1611701P` works with no path flags; on the EC2 the QSIRecon/QSIPrep paths above are used. Flags override.
+LOCAL_ZI = Path("/Users/bustos/Documents/Projects/COMBO/DATA/Tractography/ZI")
+if LOCAL_ZI.is_dir():
+    FLAT_BUNDLES_DIR = LOCAL_ZI / "bundles"
+    DEFAULT_OUT = LOCAL_ZI / "QC"
+    for _cfg in MODES.values(): _cfg["qsiprep"] = LOCAL_ZI / "ANAT"
 KEY_BUNDLES = ["CorpusCallosum", "ArcuateFasciculus", "CorticospinalTract", "OpticRadiation", "InferiorFrontoOccipital", "Cingulum", "UncinateFasciculus"]
 EXTRA_BUNDLE_DIRS = ["UF_L", "UF_R"]  # extra derivatives/ folders holding flat <sub>_<ses>_..._bundle-*.tck.gz files (uncinate)
 MAX_OUTSIDE_MASK = 0.10  # flag a bundle if more than this fraction of its points fall outside the brain mask (a starting guess)
@@ -105,26 +113,70 @@ def make_figure(anat_ras, rows, title, out_png):
     fig.savefig(out_png, dpi=110)
     plt.close(fig)
 
-def qc_session(mode, sub, ses, dwi_dir, fig_dir, key_bundles):
-    cfg = MODES[mode]
-    pattern = f"_space-{cfg['space']}_model-gqi_bundle-*_streamlines.tck.gz"
+def find_bundle_files(mode, sub, ses, dwi_dir):
+    """Bundle .tck.gz files of one session in the mode's space: dwi folder, flat --bundles-dir, and the extra UF_* folders."""
+    pattern = f"_space-{MODES[mode]['space']}_model-gqi_bundle-*_streamlines.tck.gz"
     files = {f.name: f for f in dwi_dir.glob("*" + pattern)} if dwi_dir else {}
     if FLAT_BUNDLES_DIR:
         files.update({f.name: f for f in FLAT_BUNDLES_DIR.glob(f"{sub}_{ses}*" + pattern) if f.name.startswith(f"{sub}_{ses}_")})
     for extra in ([] if FLAT_BUNDLES_DIR else EXTRA_BUNDLE_DIRS):
         for f in (QSIRECON_DIR / "derivatives" / extra).rglob(f"{sub}_{ses}*" + pattern):
             files.setdefault(f.name, f)  # a file also present under qsirecon-DSIStudio is used from there
-    files = [files[k] for k in sorted(files)]
+    return [files[k] for k in sorted(files)]
+
+def find_anat_and_mask(mode, sub, ses):
+    cfg = MODES[mode]
+    anat_path = pick_anat(cfg["qsiprep"], sub, ses, cfg["space"], cfg["anat_kinds"])
+    # the mask must come from the same folder as the anatomy (same grid)
+    masks = sorted(p for p in anat_path.parent.glob("*desc-brain_mask.nii.gz") if f"space-{cfg['space']}" in p.name) if anat_path else []
+    return anat_path, (masks[0] if masks else None)
+
+def list_sessions(sub):
+    """[(session, dwi dir or None)] of a subject, from the flat bundles folder or the QSIRecon tree."""
+    if FLAT_BUNDLES_DIR:
+        return sorted({(m.group(1), None) for f in FLAT_BUNDLES_DIR.glob(f"{sub}_ses-*.tck.gz") if (m := re.match(rf"{re.escape(sub)}_(ses-[^_]+)_", f.name))})
+    sub_dir = QSIRECON_DIR / "derivatives" / CHECK_OUTPUT_DIR / sub
+    return [(d.name, d / "dwi") for d in sorted(sub_dir.glob("ses-*")) if (d / "dwi").is_dir()]
+
+def view_in_mrview(mode, sub, session, only, dry_run):
+    """Open a subject's anatomy, brain mask and bundles together in MRtrix's mrview for visual QC."""
+    sessions = list_sessions(sub)
+    if not sessions: sys.exit(f"[ERROR] no sessions with bundles found for {sub}")
+    if session:
+        sessions = [x for x in sessions if x[0] == session]
+        if not sessions: sys.exit(f"[ERROR] {sub} has no session {session}")
+    if len(sessions) > 1: sys.exit(f"[ERROR] {sub} has several sessions: {', '.join(x[0] for x in sessions)}. Pick one with --session.")
+    ses, dwi_dir = sessions[0]
+    files = [f for f in find_bundle_files(mode, sub, ses, dwi_dir) if not only or any(o in f.name for o in only)]
+    anat, mask = find_anat_and_mask(mode, sub, ses)
+    if not anat: sys.exit(f"[ERROR] no {MODES[mode]['space']} anatomy found for {sub} {ses} under {MODES[mode]['qsiprep']}")
+    if not files: sys.exit(f"[ERROR] no {MODES[mode]['space']} bundle files found for {sub} {ses}")
+    print(f"[VIEW] {sub} {ses} | mode={mode}\n  anat: {anat}\n  mask: {mask}\n  bundles ({len(files)}):")
+    for f in files: print(f"    {f.name}")
+    if not dry_run and not shutil.which("mrview"): sys.exit("[ERROR] mrview not found on PATH (install MRtrix3)")
+    with tempfile.TemporaryDirectory() as tmp:  # mrview cannot read .tck.gz, so unzip into a temp folder
+        tcks = []
+        for f in files:
+            out = Path(tmp) / f.name[:-3]
+            if not dry_run:
+                with gzip.open(f, "rb") as src, open(out, "wb") as dst: shutil.copyfileobj(src, dst)
+            tcks.append(str(out))
+        cmd = ["mrview", str(anat)]
+        if mask: cmd += ["-roi.load", str(mask), "-roi.opacity", "0.25", "-roi.colour", "0,1,0"]
+        for t in tcks: cmd += ["-tractography.load", t]
+        print("\n" + " ".join(cmd))
+        if not dry_run: subprocess.run(cmd)  # blocks until mrview is closed, then the temp files are removed
+
+def qc_session(mode, sub, ses, dwi_dir, fig_dir, key_bundles):
+    cfg = MODES[mode]
+    files = find_bundle_files(mode, sub, ses, dwi_dir)
     summary = dict(subject=sub, session=ses, space=cfg["space"], n_bundles=len(files), anat="", mask="", flags="")
     bundle_rows, flags = [], []
     if not files:
         summary["flags"] = f"NO_BUNDLES_IN_SPACE_{cfg['space']}"
         return summary, bundle_rows, set()
 
-    anat_path = pick_anat(cfg["qsiprep"], sub, ses, cfg["space"], cfg["anat_kinds"])
-    # the mask must come from the same folder as the anatomy (same grid)
-    masks = sorted(p for p in anat_path.parent.glob("*desc-brain_mask.nii.gz") if f"space-{cfg['space']}" in p.name) if anat_path else []
-    mask_path = masks[0] if masks else None
+    anat_path, mask_path = find_anat_and_mask(mode, sub, ses)
     summary["anat"], summary["mask"] = str(anat_path or ""), str(mask_path or "")
     if anat_path is None: flags.append("NO_ANAT")
     if mask_path is None: flags.append("NO_MASK")
@@ -178,21 +230,32 @@ def write_csv(path, rows, fields):
 
 def main():
     ap = argparse.ArgumentParser(description="QC QSIRecon DSI Studio bundles (.tck.gz) over the QSIPrep anatomy.")
-    ap.add_argument("--mode", required=True, choices=MODES, help="mom = space-T1w bundles, baby = space-ACPC bundles")
+    ap.add_argument("--mode", choices=MODES, help="mom or baby (both use space-ACPC bundles); optional with --view, where it is guessed from the ID (...P = mom)")
     ap.add_argument("--subjects", nargs="*", help="subject IDs (with or without 'sub-'); default: every subject of this cohort found in the outputs")
     ap.add_argument("--out", type=Path, default=DEFAULT_OUT, help=f"QC output root (default {DEFAULT_OUT})")
     ap.add_argument("--qsirecon-dir", type=Path, help=f"QSIRecon output root containing derivatives/ (default {OUTPUT_DERIVATIVES_DIR})")
     ap.add_argument("--bundles-dir", type=Path, help="flat folder of <sub>_<ses>_*_bundle-*.tck.gz files (e.g. ZI/bundles); replaces the QSIRecon tree")
     ap.add_argument("--qsiprep-dir", type=Path, help="QSIPrep output root (or a folder with the synced sub-*/anat files) holding the ACPC anatomy + brain mask")
+    ap.add_argument("--view", metavar="SUBJECT", help="open this subject's anatomy + brain mask + bundles together in MRtrix mrview, then exit (no QC run)")
+    ap.add_argument("--session", help="with --view: session to open (e.g. ses-44445055); needed if the subject has several")
+    ap.add_argument("--only", nargs="*", help="with --view: load only bundles whose name contains one of these (e.g. Uncinate)")
+    ap.add_argument("--dry-run", action="store_true", help="with --view: print what would be opened and the mrview command, without launching it")
     ap.add_argument("--limit", type=int, help="only QC the first N sessions (for testing)")
     ap.add_argument("--key-bundles", nargs="*", default=KEY_BUNDLES, help="bundle-name substrings to show as their own figure rows")
     args = ap.parse_args()
 
     global QSIRECON_DIR, FLAT_BUNDLES_DIR
+    if not args.mode:
+        if not args.view: ap.error("--mode is required (unless using --view)")
+        args.mode = "mom" if args.view.lower().endswith("p") else "baby"
     cfg = MODES[args.mode]
     if args.qsirecon_dir: QSIRECON_DIR = args.qsirecon_dir
     if args.bundles_dir: FLAT_BUNDLES_DIR = args.bundles_dir
+    elif args.qsirecon_dir: FLAT_BUNDLES_DIR = None  # an explicit QSIRecon tree overrides the local flat-folder default
     if args.qsiprep_dir: cfg["qsiprep"] = args.qsiprep_dir
+    if args.view:
+        view_in_mrview(args.mode, args.view if args.view.startswith("sub-") else f"sub-{args.view}", args.session, args.only, args.dry_run)
+        return
     # sessions to QC: (subject, session, dwi dir or None for a flat bundles folder)
     jobs, summaries = [], []
     if FLAT_BUNDLES_DIR:
