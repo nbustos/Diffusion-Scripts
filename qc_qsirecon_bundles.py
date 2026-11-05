@@ -138,7 +138,7 @@ def list_sessions(sub):
     sub_dir = QSIRECON_DIR / "derivatives" / CHECK_OUTPUT_DIR / sub
     return [(d.name, d / "dwi") for d in sorted(sub_dir.glob("ses-*")) if (d / "dwi").is_dir()]
 
-def view_in_mrview(mode, sub, session, only, dry_run):
+def view_in_mrview(mode, sub, session, only, dry_run, mask_opacity):
     """Open a subject's anatomy, brain mask and bundles together in MRtrix's mrview for visual QC."""
     sessions = list_sessions(sub)
     if not sessions: sys.exit(f"[ERROR] no sessions with bundles found for {sub}")
@@ -161,11 +161,34 @@ def view_in_mrview(mode, sub, session, only, dry_run):
             if not dry_run:
                 with gzip.open(f, "rb") as src, open(out, "wb") as dst: shutil.copyfileobj(src, dst)
             tcks.append(str(out))
-        cmd = ["mrview", str(anat)]
-        if mask: cmd += ["-roi.load", str(mask), "-roi.opacity", "0.25", "-roi.colour", "0,1,0"]
+        cmd = ["mrview", str(anat), "-mode", "2"]  # 2 = ortho view (mrview otherwise reopens in whichever mode was used last)
+        if mask: cmd += ["-roi.load", str(mask), "-roi.opacity", str(mask_opacity), "-roi.colour", "0,1,0"]
         for t in tcks: cmd += ["-tractography.load", t]
         print("\n" + " ".join(cmd))
         if not dry_run: subprocess.run(cmd)  # blocks until mrview is closed, then the temp files are removed
+
+COLLATE_FIELDS = ["subject_id", "session_id", "Mom", "mean_fd", "raw_num_bad_slices", "bad_slice_fraction",
+                  "raw_masked_neighbor_corr", "raw_num_directions", "raw_max_b", "t1_dice_distance"]
+
+def collate_motion(motion_dir, out_csv):
+    """One row per QSIPrep *desc-image_qc.tsv: the five usability metrics + Mom (1 = mom, 0 = baby; moms' IDs end in P)."""
+    num = lambda r, c: float(r[c]) if r.get(c) not in (None, "", "n/a") else None
+    rows = []
+    for f in sorted(motion_dir.glob("*desc-image_qc.tsv")):
+        with open(f, newline="") as fh:
+            for r in csv.DictReader(fh, delimiter="\t"):
+                nz, nd, nb = num(r, "raw_dimension_z"), num(r, "raw_num_directions"), num(r, "raw_num_bad_slices")
+                sid = r.get("subject_id") or f.name.split("_")[0]
+                rows.append(dict(
+                    subject_id=sid, session_id=r.get("session_id") or f.name.split("_")[1],
+                    Mom=int(MODES["mom"]["is_cohort"](sid.removeprefix("sub-"))),
+                    mean_fd=num(r, "mean_fd"), raw_num_bad_slices=nb,
+                    bad_slice_fraction=round(nb / (nz * nd), 6) if nb is not None and nz and nd else None,
+                    raw_masked_neighbor_corr=num(r, "raw_masked_neighbor_corr"), raw_num_directions=nd,
+                    raw_max_b=num(r, "raw_max_b"), t1_dice_distance=num(r, "t1_dice_distance")))
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    write_csv(out_csv, rows, COLLATE_FIELDS)
+    print(f"[COLLATE] {len(rows)} sessions ({sum(r['Mom'] for r in rows)} moms, {sum(1 - r['Mom'] for r in rows)} babies) from {motion_dir}\n  -> {out_csv}")
 
 def qc_session(mode, sub, ses, dwi_dir, fig_dir, key_bundles):
     cfg = MODES[mode]
@@ -239,12 +262,18 @@ def main():
     ap.add_argument("--view", metavar="SUBJECT", help="open this subject's anatomy + brain mask + bundles together in MRtrix mrview, then exit (no QC run)")
     ap.add_argument("--session", help="with --view: session to open (e.g. ses-44445055); needed if the subject has several")
     ap.add_argument("--only", nargs="*", help="with --view: load only bundles whose name contains one of these (e.g. Uncinate)")
+    ap.add_argument("--mask-opacity", type=float, default=0.1, help="with --view: brain mask overlay opacity, 0-1 (default 0.1)")
     ap.add_argument("--dry-run", action="store_true", help="with --view: print what would be opened and the mrview command, without launching it")
+    ap.add_argument("--collate", action="store_true", help="write one CSV of the motion/usability metrics for all subjects (+ Mom column: 1 = mom, 0 = baby) from the QSIPrep *desc-image_qc.tsv files, then exit")
+    ap.add_argument("--motion-dir", type=Path, default=LOCAL_ZI / "motion", help="with --collate: folder of *desc-image_qc.tsv files (default: ZI/motion)")
     ap.add_argument("--limit", type=int, help="only QC the first N sessions (for testing)")
     ap.add_argument("--key-bundles", nargs="*", default=KEY_BUNDLES, help="bundle-name substrings to show as their own figure rows")
     args = ap.parse_args()
 
     global QSIRECON_DIR, FLAT_BUNDLES_DIR
+    if args.collate:
+        collate_motion(args.motion_dir, args.out / "motion_qc_metrics.csv")
+        return
     if not args.mode:
         if not args.view: ap.error("--mode is required (unless using --view)")
         args.mode = "mom" if args.view.lower().endswith("p") else "baby"
@@ -254,7 +283,7 @@ def main():
     elif args.qsirecon_dir: FLAT_BUNDLES_DIR = None  # an explicit QSIRecon tree overrides the local flat-folder default
     if args.qsiprep_dir: cfg["qsiprep"] = args.qsiprep_dir
     if args.view:
-        view_in_mrview(args.mode, args.view if args.view.startswith("sub-") else f"sub-{args.view}", args.session, args.only, args.dry_run)
+        view_in_mrview(args.mode, args.view if args.view.startswith("sub-") else f"sub-{args.view}", args.session, args.only, args.dry_run, args.mask_opacity)
         return
     # sessions to QC: (subject, session, dwi dir or None for a flat bundles folder)
     jobs, summaries = [], []
