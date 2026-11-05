@@ -8,6 +8,8 @@
 import argparse
 import csv
 import gzip
+import re
+import warnings
 import shutil
 import sys
 import tempfile
@@ -16,6 +18,7 @@ from pathlib import Path
 import numpy as np
 import nibabel as nib
 from nibabel.streamlines import TckFile
+warnings.filterwarnings("ignore", message=".*encountered in matmul")  # spurious numpy-on-macOS warning; results verified identical
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -30,6 +33,7 @@ MODES = {
                  is_cohort=lambda i: i[-1].isdigit()),
 }
 QSIRECON_DIR = OUTPUT_DERIVATIVES_DIR  # overridable with --qsirecon-dir
+FLAT_BUNDLES_DIR = None  # --bundles-dir: one flat folder of <sub>_<ses>_*.tck.gz files instead of the QSIRecon tree
 DEFAULT_OUT = Path("/Marshlab/data/COMBO/diffusion_qc")
 KEY_BUNDLES = ["CorpusCallosum", "ArcuateFasciculus", "CorticospinalTract", "OpticRadiation", "InferiorFrontoOccipital", "Cingulum", "UncinateFasciculus"]
 EXTRA_BUNDLE_DIRS = ["UF_L", "UF_R"]  # extra derivatives/ folders holding flat <sub>_<ses>_..._bundle-*.tck.gz files (uncinate)
@@ -51,15 +55,23 @@ def load_points(path):
         with gzip.open(path, "rb") as src, open(tck, "wb") as dst: shutil.copyfileobj(src, dst)
         return TckFile.load(str(tck), lazy_load=False).streamlines.get_data()
 
-def find_anat(qsiprep_dir, sub, ses, space, kind):
-    """Find <qsiprep>/sub/(ses/)anat/*<kind>.nii.gz in the requested space; prefer this session's file, else the subject-level one."""
+def find_anat(qsiprep_dir, sub, ses, space, kind, ses_only=False):
+    """Find <qsiprep>/sub/(ses/)anat/*<kind>.nii.gz in the requested space; prefer this session's file, else (unless ses_only) the subject-level one."""
     if not (qsiprep_dir / sub).is_dir(): return None
     if space == "ACPC": ok = lambda p: "space-ACPC" in p.name
     else: ok = lambda p: "space-" not in p.name or f"space-{space}" in p.name  # native T1w carries no space entity
     cands = [p for p in (qsiprep_dir / sub).rglob(f"*{kind}.nii.gz") if p.parent.name == "anat" and ok(p)]
     mine = [p for p in cands if ses in p.parts or f"_{ses}_" in p.name]
-    pick = mine or cands
+    pick = mine if ses_only else (mine or cands)
     return sorted(pick)[0] if pick else None
+
+def pick_anat(qsiprep_dir, sub, ses, space, kinds):
+    """First anatomy found: session-level files (any kind, in order) before subject-level ones."""
+    for ses_only in (True, False):
+        for k in kinds:
+            p = find_anat(qsiprep_dir, sub, ses, space, k, ses_only)
+            if p: return p
+    return None
 
 def density_and_outside(points, inv_affine, shape, mask):
     """Voxel-count map of the points on the anatomy grid, and the fraction of points outside the mask (or the image)."""
@@ -96,9 +108,11 @@ def make_figure(anat_ras, rows, title, out_png):
 def qc_session(mode, sub, ses, dwi_dir, fig_dir, key_bundles):
     cfg = MODES[mode]
     pattern = f"_space-{cfg['space']}_model-gqi_bundle-*_streamlines.tck.gz"
-    files = {f.name: f for f in dwi_dir.glob("*" + pattern)}
-    for extra in EXTRA_BUNDLE_DIRS:
-        for f in (QSIRECON_DIR / "derivatives" / extra).rglob(f"{sub}_{ses}_*" + pattern):
+    files = {f.name: f for f in dwi_dir.glob("*" + pattern)} if dwi_dir else {}
+    if FLAT_BUNDLES_DIR:
+        files.update({f.name: f for f in FLAT_BUNDLES_DIR.glob(f"{sub}_{ses}*" + pattern) if f.name.startswith(f"{sub}_{ses}_")})
+    for extra in ([] if FLAT_BUNDLES_DIR else EXTRA_BUNDLE_DIRS):
+        for f in (QSIRECON_DIR / "derivatives" / extra).rglob(f"{sub}_{ses}*" + pattern):
             files.setdefault(f.name, f)  # a file also present under qsirecon-DSIStudio is used from there
     files = [files[k] for k in sorted(files)]
     summary = dict(subject=sub, session=ses, space=cfg["space"], n_bundles=len(files), anat="", mask="", flags="")
@@ -107,14 +121,23 @@ def qc_session(mode, sub, ses, dwi_dir, fig_dir, key_bundles):
         summary["flags"] = f"NO_BUNDLES_IN_SPACE_{cfg['space']}"
         return summary, bundle_rows, set()
 
-    anat_path = next((p for k in cfg["anat_kinds"] if (p := find_anat(cfg["qsiprep"], sub, ses, cfg["space"], k))), None)
-    mask_path = find_anat(cfg["qsiprep"], sub, ses, cfg["space"], "desc-brain_mask")
+    anat_path = pick_anat(cfg["qsiprep"], sub, ses, cfg["space"], cfg["anat_kinds"])
+    # the mask must come from the same folder as the anatomy (same grid)
+    masks = sorted(p for p in anat_path.parent.glob("*desc-brain_mask.nii.gz") if f"space-{cfg['space']}" in p.name) if anat_path else []
+    mask_path = masks[0] if masks else None
     summary["anat"], summary["mask"] = str(anat_path or ""), str(mask_path or "")
     if anat_path is None: flags.append("NO_ANAT")
     if mask_path is None: flags.append("NO_MASK")
 
-    anat_img = nib.load(anat_path) if anat_path else None
-    mask = np.asarray(nib.load(mask_path).dataobj) if mask_path else None
+    anat_img, anat_data, mask = None, None, None
+    try:  # a truncated/partly synced file must not stop the whole run
+        if anat_path:
+            anat_img = nib.load(anat_path)
+            anat_data = np.asarray(anat_img.dataobj, dtype=np.float32)
+        mask = np.asarray(nib.load(mask_path).dataobj) if mask_path else None
+    except Exception as e:
+        flags.append(f"ANAT_UNREADABLE:{type(e).__name__}")
+        anat_img, anat_data, mask = None, None, None
     if anat_img is not None and mask is not None and mask.shape != anat_img.shape[:3]:
         flags.append("MASK_GRID_MISMATCH")
         mask = None
@@ -140,8 +163,7 @@ def qc_session(mode, sub, ses, dwi_dir, fig_dir, key_bundles):
     summary["total_streamlines"] = sum(r["n_streamlines"] or 0 for r in bundle_rows)
     if anat_img is not None:
         affine = anat_img.affine
-        data = np.asarray(anat_img.dataobj, dtype=np.float32)
-        anat_ras = to_ras(data[..., 0] if data.ndim == 4 else data, affine)
+        anat_ras = to_ras(anat_data[..., 0] if anat_data.ndim == 4 else anat_data, affine)
         rows = [("ALL bundles", to_ras(total, affine))] + [(n, to_ras(d, affine)) for n, d in key_dens]
         out_png = fig_dir / f"{sub}_{ses}_{cfg['space']}_bundleQC.png"
         make_figure(anat_ras, rows, f"{sub} {ses} | {cfg['space']} | {anat_path.name}", out_png)
@@ -160,37 +182,46 @@ def main():
     ap.add_argument("--subjects", nargs="*", help="subject IDs (with or without 'sub-'); default: every subject of this cohort found in the outputs")
     ap.add_argument("--out", type=Path, default=DEFAULT_OUT, help=f"QC output root (default {DEFAULT_OUT})")
     ap.add_argument("--qsirecon-dir", type=Path, help=f"QSIRecon output root containing derivatives/ (default {OUTPUT_DERIVATIVES_DIR})")
+    ap.add_argument("--bundles-dir", type=Path, help="flat folder of <sub>_<ses>_*_bundle-*.tck.gz files (e.g. ZI/bundles); replaces the QSIRecon tree")
     ap.add_argument("--qsiprep-dir", type=Path, help="QSIPrep output root (or a folder with the synced sub-*/anat files) holding the ACPC anatomy + brain mask")
     ap.add_argument("--limit", type=int, help="only QC the first N sessions (for testing)")
     ap.add_argument("--key-bundles", nargs="*", default=KEY_BUNDLES, help="bundle-name substrings to show as their own figure rows")
     args = ap.parse_args()
 
-    global QSIRECON_DIR
+    global QSIRECON_DIR, FLAT_BUNDLES_DIR
     cfg = MODES[args.mode]
     if args.qsirecon_dir: QSIRECON_DIR = args.qsirecon_dir
+    if args.bundles_dir: FLAT_BUNDLES_DIR = args.bundles_dir
     if args.qsiprep_dir: cfg["qsiprep"] = args.qsiprep_dir
-    dsi_dir = QSIRECON_DIR / "derivatives" / CHECK_OUTPUT_DIR
-    if not dsi_dir.is_dir(): sys.exit(f"[ERROR] {dsi_dir} not found")
-    if args.subjects: subs = [s if s.startswith("sub-") else f"sub-{s}" for s in args.subjects]
-    else: subs = sorted(d.name for d in dsi_dir.glob("sub-*") if d.is_dir() and cfg["is_cohort"](d.name[4:]))
+    # sessions to QC: (subject, session, dwi dir or None for a flat bundles folder)
+    jobs, summaries = [], []
+    if FLAT_BUNDLES_DIR:
+        found = sorted({m.groups() for f in FLAT_BUNDLES_DIR.glob("sub-*_ses-*.tck.gz") if (m := re.match(r"(sub-[^_]+)_(ses-[^_]+)_", f.name))})
+        wanted = {s if s.startswith("sub-") else f"sub-{s}" for s in args.subjects} if args.subjects else None
+        jobs = [(sub, ses, None) for sub, ses in found if (sub in wanted if wanted else cfg["is_cohort"](sub[4:]))]
+        subs = sorted({j[0] for j in jobs})
+    else:
+        dsi_dir = QSIRECON_DIR / "derivatives" / CHECK_OUTPUT_DIR
+        if not dsi_dir.is_dir(): sys.exit(f"[ERROR] {dsi_dir} not found")
+        if args.subjects: subs = [s if s.startswith("sub-") else f"sub-{s}" for s in args.subjects]
+        else: subs = sorted(d.name for d in dsi_dir.glob("sub-*") if d.is_dir() and cfg["is_cohort"](d.name[4:]))
+        for sub in subs:
+            sessions = sorted(d for d in (dsi_dir / sub).glob("ses-*") if (d / "dwi").is_dir())
+            if not sessions:
+                summaries.append(dict(subject=sub, session="", space=cfg["space"], n_bundles=0, flags="NO_SESSION_DWI_DIR"))
+                print(f"  {sub}: no ses-*/dwi folder")
+            jobs += [(sub, d.name, d / "dwi") for d in sessions]
 
     out_dir = args.out / f"qsirecon_bundles_{args.mode}"
     fig_dir = out_dir / "figures"
     fig_dir.mkdir(parents=True, exist_ok=True)
-    print(f"[QC] mode={args.mode} | space={cfg['space']} | {len(subs)} subjects | output: {out_dir}")
+    print(f"[QC] mode={args.mode} | space={cfg['space']} | {len(subs)} subjects, {len(jobs)} sessions | output: {out_dir}")
 
-    summaries, bundle_rows, names_by_session = [], [], {}
-    for sub in subs:
-        sessions = sorted(d for d in (dsi_dir / sub).glob("ses-*") if (d / "dwi").is_dir())
-        if not sessions:
-            summaries.append(dict(subject=sub, session="", space=cfg["space"], n_bundles=0, flags="NO_SESSION_DWI_DIR"))
-            print(f"  {sub}: no ses-*/dwi folder")
-            continue
-        for ses_dir in sessions:
-            if args.limit and len(names_by_session) >= args.limit: break
-            print(f"  {sub} {ses_dir.name} ...", flush=True)
-            s, b, names = qc_session(args.mode, sub, ses_dir.name, ses_dir / "dwi", fig_dir, args.key_bundles)
-            summaries.append(s); bundle_rows += b; names_by_session[(sub, ses_dir.name)] = names
+    bundle_rows, names_by_session = [], {}
+    for sub, ses, dwi_dir in jobs[:args.limit]:
+        print(f"  {sub} {ses} ...", flush=True)
+        s, b, names = qc_session(args.mode, sub, ses, dwi_dir, fig_dir, args.key_bundles)
+        summaries.append(s); bundle_rows += b; names_by_session[(sub, ses)] = names
 
     # bundles present in at least half of the sessions but absent from a given one
     common = {n for n in set().union(*names_by_session.values()) if sum(n in v for v in names_by_session.values()) >= len(names_by_session) / 2} if names_by_session else set()
