@@ -3,4 +3,5 @@
 Scripts for diffusion MRI processing.
 
 - `combo_qsirecon.py` - QSIRecon combo script
+- `combo_qsiprep.py` - interactive QSIPrep 1.0.0 launcher for COMBO moms and babies
 - `qc_qsirecon_bundles.py` - QC of QSIRecon DSI Studio bundles (`--mode mom|baby`)
