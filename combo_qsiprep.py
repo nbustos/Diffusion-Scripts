@@ -297,6 +297,7 @@ def build_docker_command(subject, nthreads, mem_mb, cohort_target):
         "--mem-mb",
         str(mem_mb),
         "--notrack",
+        "--skip-bids-validation",
         *qsiprep_params_for(cohort_target),
         "-v",
     ]
